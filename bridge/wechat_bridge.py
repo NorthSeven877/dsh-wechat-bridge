@@ -169,6 +169,18 @@ def clean_text(text):
     return " ".join(t.split()).strip()
 
 
+def 出站过滤词表():
+    """主人在配置里列的出站违禁子串（比如不想出现的 emoji 和口头禅）。
+    现读配置文件，改完即刻生效，不用重启桥。"""
+    try:
+        home = os.environ.get("DSH_HOME") or os.path.join(os.path.expanduser("~"), ".dsh")
+        with open(os.path.join(home, "wechat-bridge-config.json"), encoding="utf-8-sig") as f:
+            c = json.load(f) or {}
+        return [str(x).strip() for x in (c.get("出站文字过滤") or []) if str(x).strip()]
+    except Exception:
+        return []
+
+
 _AT_TOKEN = re.compile(r"[@＠]\s*([^\s@＠:：,，。、;；!！?？\u2005]{1,30})")
 
 
@@ -254,6 +266,17 @@ def main():
             log("发送节流档位：", _p.name, "（%d 秒内 %d 次）" % (int(_p.window), _p.burst))
         except Exception as _e:
             log("节流档位调整失败（不影响用）：", repr(_e))
+        # DB 验货（发完回读确认）：微信写库是异步的，默认 8 秒太紧 —— 微信写库一慢，
+        # 明明发成功的消息也被判「未确认」，上层就补回车：每条白钝 13 秒，还有重发风险。
+        # 放宽到 20 秒；再查不到交给 试() 里的桥接层二次核对兜底。
+        try:
+            from wechatauto.param import WxParam as _WP
+
+            _WP.DB_VERIFY_TIMEOUT = 20
+            _WP.DB_VERIFY_INTERVAL = 1.0
+            log("DB 验货超时：8s → 20s（治「库里没确认补回车」）")
+        except Exception as _e:
+            log("DB 验货超时调整失败（不影响用）：", repr(_e))
     except Exception as e:
         log("✗ import wechatauto 失败：", repr(e))
         log("  依赖没装好 —— 回 DSH 设置页点「装依赖」")
@@ -1006,7 +1029,12 @@ def main():
         return False
 
     def 拆条(text: str, 上限: int = 26):
-        """把一段话拆成几条短消息：先按换行分段，长段再按句子拆。"""
+        """单气泡模式：整段不超上限就发一条——正文里的换行原样保留，
+        微信输入框粘贴多行文字只换行不发送，等同 Ctrl+回车，全数装进一个气泡。
+        超过上限的长文才拆多条：先按换行断开，长段再按句子拆（老逻辑兜底）。"""
+        全文 = str(text or "").strip()
+        if 0 < len(全文) <= 上限:
+            return [全文]
         out = []
         for 段 in re.split(r"\n+", str(text or "")):
             段 = 段.strip()
@@ -1061,6 +1089,16 @@ def main():
         except Exception:
             pass
         return False
+
+    # 两个可调旋钮（主人按需调）：
+    # 发送前置前：发送前强制把微信窗口摆到前台，治「窗口被挡 → UIA 卡住 → 发送超时」
+    # （实测几次发送卡死皆源于此）。finally 里已有 _取消置顶 + _还原窗口，
+    # 发完会把前台还给主人。想回到安静模式就改成 False。
+    发送前置前 = True
+    # 拆条上限：原来 26 字一条，回个话像机关枪扫射，且每条都要走一遍粘贴-回车-验货。
+    # 常见诉求：每回应装进一个气泡——微信输入框粘贴多行文字只换行不发送（Ctrl+回车同理），
+    # 故把上限放宽到一整篇；除非长过贴不进输入框，否则不拆。
+    拆条上限 = 1500
 
     # 进程内「这句我已经发出去过」的记录。数据库查询有 25/120 秒的时间窗，
     # 兜底通道晚几秒醒来、或者拆条后隔了几十秒再补发，窗口一过就会重复发一遍
@@ -1384,6 +1422,14 @@ def main():
 
         text = re.sub(r"!\[[^\]]*\]\((https?://[^)\s]+)\)", _摘图, text).strip()
 
+        # 出站过滤（主人在配置里列的违禁子串）：命中即从正文剥除；
+        # 词表现读配置文件，主人改完配置即刻生效，不用重启桥。
+        for 滤 in 出站过滤词表():
+            if 滤 and 滤 in text:
+                text = text.replace(滤, "")
+                log("🚫 出站被过滤拦下子串：「%s」" % 滤[:30])
+        text = text.strip()
+
         if not text and not images:
             return {"ok": False, "说": "空消息"}
         if not chat:
@@ -1397,9 +1443,9 @@ def main():
             窗口快照 = _快照窗口()
             守护 = _守护最小化(窗口快照.get("hwnd")) if 窗口快照.get("iconic") else None
             try:
-                # 先不抢前台：同一条会话里连发时，UIA 直接写控件就够了，
-                # 把窗口顶上来只会让主人看见它闪。只有要切会话时才摆正窗口。
-                _ensure_wechat_ready(前台=False)
+                # 发送前置前=True：先把微信摆到前台再动 —— 「UIA 卡死/窗口卡住」多半
+                # 是微信被别的窗口压着造成的。想安静发送就把旋钮改成 False。
+                _ensure_wechat_ready(前台=发送前置前)
                 gui = get_gui()
                 # 每次发送前重取一次引擎：微信跑久了 accessibility 会假死，
                 # 缓存的引擎能收消息却一条也发不出去
@@ -1457,7 +1503,7 @@ def main():
                         return "发送超时"
                     return 盒.get("e") or 盒.get("r")
 
-                def 试(动作, 名字, 重试前=1):
+                def 试(动作, 名字, 重试前=1, 核对=None):
                     """发一次；返回失败（不是抛异常）也要当成失败 —— 窗口没接住时就是这样。"""
                     for 第 in range(重试前 + 1):
                         try:
@@ -1473,7 +1519,28 @@ def main():
                             原因 = str(r)
                         # 已经发出去了、只是数据库还没落库 —— 再发一遍就成了两条重复消息
                         if "未确认" in 原因 or "已操作发送" in 原因:
-                            # 但字也可能压根没发出去，就卡在输入框里 —— 补一次回车再确认
+                            # 微信写库是异步的：库里 8~20 秒查不到 ≠ 没发出去。先花十几秒
+                            # 用桥接层自己的包含匹配（库端 exact 逐字太苛刻）补核一遍；
+                            # 核到了就别碰回车 —— 「补的那一脚」才是重复消息的源头。
+                            补核到了 = False
+                            if 核对 is not None:
+                                for _ in range(6):
+                                    try:
+                                        if 核对():
+                                            补核到了 = True
+                                            break
+                                    except Exception:
+                                        break
+                                    time.sleep(1.8)
+                            if 补核到了:
+                                log("库里迟到的确认（没补回车）：" + 原因[:50])
+                                return True
+                            # 库里真没有：字还堵在输入框里才值得踹一脚；
+                            # 框已空说明多半是发出去了、库只是写得慢，别再乱按回车。
+                            框 = _框里的字()
+                            if 框 is not None and not 框.strip():
+                                log("发出去但库里没确认，输入框已空，不补回车：" + 原因[:50])
+                                return True
                             if _kick_enter():
                                 time.sleep(1.2)
                                 log("已操作发送但库里没确认，补了一次回车：" + 原因[:50])
@@ -1493,7 +1560,7 @@ def main():
 
                 if text:
                     # 长内容拆成几条短消息发（一个大气泡读着累）—— 每段不超过 60 字
-                    for 一 in 拆条(text):
+                    for 一 in 拆条(text, 上限=拆条上限):
                         # 重试前先看库里：这句话刚发过就不再点第二遍
                         if _段已发过(一):
                             log("这句我发过（内存记录），跳过：%s" % 一[:30])
@@ -1503,7 +1570,8 @@ def main():
                             _记发过(一)
                             recently_sent.append((clean_text(一), time.time()))
                             continue
-                        ok = 试(lambda g, t=一: g.send_msg(t, chat, True), "发文字")
+                        ok = 试(lambda g, t=一: g.send_msg(t, chat, True), "发文字",
+                                核对=lambda: _already_sent(一, chat, within=90))
                         if not ok and _already_sent(一, chat, within=25):
                             log("接口说失败，但库里查到了 —— 算发成功：%s" % 一[:30])
                             ok = True
@@ -1525,7 +1593,8 @@ def main():
                                 _ensure_wechat_ready(前台=True)
                                 time.sleep(0.5)
                                 gui.open_chat(chat)
-                                if 试(lambda g, t=一: g.send_msg(t, chat, True), "发文字（前台重试）"):
+                                if 试(lambda g, t=一: g.send_msg(t, chat, True), "发文字（前台重试）",
+                                       核对=lambda: _already_sent(一, chat, within=90)):
                                     ok = True
                             except Exception as e:
                                 log("前台重试异常：", repr(e))
