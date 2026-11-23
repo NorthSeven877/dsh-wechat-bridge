@@ -73,6 +73,9 @@ POLL_SEC = 2.0
 # 群里只有被点名才转（正文里带这些词之一）。私聊不受这个限制。
 ALIASES = []
 DEFAULT_ALIASES = "大肥鱼,鲸鲸,鲸鱼娘,鲸鱼,肥鱼"
+# 本桥接微信账号的 wxid / 昵称：启动时注入，群里 @ 本账号时自动算点名
+MY_WXID = ""
+MY_NICK = ""
 
 # 从 DSH 设置页拉的配置（每 30 秒刷一次）
 CFG = {
@@ -166,6 +169,47 @@ def clean_text(text):
     return " ".join(t.split()).strip()
 
 
+_AT_TOKEN = re.compile(r"[@＠]\s*([^\s@＠:：,，。、;；!！?？\u2005]{1,30})")
+
+
+def 点名别名表():
+    """群里叫到这些名字才算点名。来源三合一：
+    ① 桥接启动参数 --aliases；② 主人配置「点名别名」（现读磁盘，改完即刻生效）；
+    ③ 本账号自己的昵称（启动时从通讯录拿）。"""
+    表 = [str(a).strip() for a in ALIASES if str(a).strip()]
+    try:
+        home = os.environ.get("DSH_HOME") or os.path.join(os.path.expanduser("~"), ".dsh")
+        with open(os.path.join(home, "wechat-bridge-config.json"), encoding="utf-8-sig") as f:
+            c = json.load(f) or {}
+        for x in (c.get("点名别名") or []):
+            x = str(x).strip()
+            if x and x not in 表:
+                表.append(x)
+    except Exception:
+        pass
+    if MY_NICK and MY_NICK not in 表:
+        表.append(MY_NICK)
+    return 表
+
+
+def 被at了(raw):
+    """@ 检测加固：微信 @ 人时正文里带的是对方的备注/昵称原文。
+    只看 @ 后面那个词是否命中别名（整串包含或互为前后缀都行），
+    平时闲聊提到名字不会被误判成点名；老参数 --aliases 仍按全文子串兜底。"""
+    raw = raw or ""
+    if any(a in raw for a in ALIASES if str(a).strip()):
+        return True
+    表 = 点名别名表()
+    for tok in _AT_TOKEN.findall(raw):
+        tok = tok.strip()
+        for a in 表:
+            if not a:
+                continue
+            if a in tok or (len(tok) >= 2 and tok in a):
+                return True
+    return False
+
+
 # ---------- HTTP ----------
 
 def http_json(path, payload=None, method=None):
@@ -233,10 +277,13 @@ def main():
         log("  检查：微信登录了吗？微信 → 设置 → 文件管理 → 默认保存位置")
         return 2
     me = getattr(db, "wxid", "")
+    global MY_WXID, MY_NICK
+    MY_WXID = str(me or "")
     log("当前账号 wxid：", me)
     try:
         info = db.get_self_info() or {}
-        log("昵称：", info.get("nick_name") or info.get("remark") or "?")
+        MY_NICK = str(info.get("nick_name") or info.get("remark") or "").strip()
+        log("昵称：", MY_NICK or "?")
     except Exception:
         pass
 
@@ -2129,7 +2176,7 @@ def main():
             # 群里：点名 / 主人说话 / 活跃群 才进 DSH（不然每个群都在刷屏）
             at_me = False
             if is_group:
-                at_me = any(a in raw for a in ALIASES)
+                at_me = 被at了(raw)
                 called = (
                     at_me
                     or is_master(sender, nickname)
