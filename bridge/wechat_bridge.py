@@ -2010,10 +2010,35 @@ def main():
             p = 媒体["下载器"].download_image(
                 username, local_id, save_dir=folder, tier="best", shard=msg.get("shard")
             )
-            if p and os.path.isfile(p) and os.path.getsize(p) > 0:
-                log("图片落盘：%s" % p)
-                return p
-            return None
+            if not (p and os.path.isfile(p) and os.path.getsize(p) > 0):
+                return None
+            if str(p).lower().endswith(".wxgf"):
+                # wxgf 是微信自家容器（内封 HEVC），机器看不懂。退回缩略图档：
+                # 缩略图是普通 jpg，视觉模型和读图工具都认得，总比一团雾气强。
+                try:
+                    t = 媒体["下载器"].download_image(
+                        username, local_id, save_dir=folder, tier="thumb", shard=msg.get("shard")
+                    )
+                    if t and os.path.isfile(t) and os.path.getsize(t) > 0:
+                        log("wxgf 机器不认，退回缩略图：%s" % t)
+                        p = t
+                except Exception as e:
+                    log("wxgf 退缩略图失败：", repr(e))
+            # 拿到的是缩略图档 ⇒ 本机根本没存原件（微信按需下载，_h.dat 未落盘）。
+            # 驱动界面走一趟点击路径，把真原件取回来；取不到仍用缩略图，总比没有强。
+            if "_thumb" in os.path.basename(str(p)).lower():
+                try:
+                    o = 媒体["下载器"].download_image_original(
+                        username, local_id, save_dir=folder, shard=msg.get("shard"), timeout=30
+                    )
+                    if (o and os.path.isfile(o) and os.path.getsize(o) > os.path.getsize(p)
+                            and not str(o).lower().endswith(".wxgf")):
+                        log("取回原图：%s（%d KB）" % (o, os.path.getsize(o) // 1024))
+                        return o
+                except Exception as e:
+                    log("取原图失败（退回缩略图）：", repr(e))
+            log("图片落盘：%s" % p)
+            return p
         except Exception as e:
             log("图片落盘失败：", repr(e))
             return None
